@@ -1,16 +1,16 @@
 """
-Rheinmetall 5.5 cm Gerat 58 Interactive Museum Engine.
-Author: CMC Correo Hofstad - USAF
-
-This module maps the 17 operational controls, integrates the mechanical 
-pulse oiler, evaluates the pneumatic breech loading steps, calculates live 
-ballistic force profiles, and includes the interactive maintenance mode sequence.
+Rheinmetall 5.5 cm Gerat 58 Interactive Museum Engine & Univac Aegis Bridge.
+Architecture: Asynchronous Combat Loop with Telemetry Uplink
 """
 
 import time
 import math
-import sys
+import asyncio
+import logging
 from typing import Dict, Any, Tuple
+from kdo58_univac_aviation_bridge import TriSystemBridge
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | [KDO58 SERVER] | %(message)s")
 
 def calculate_ballistic_force(mass_kg: float, velocity_m_s: float, barrel_len_m: float = 4.2) -> Dict[str, float]:
     """Computes muzzle energy and internal acceleration force profiles."""
@@ -19,12 +19,11 @@ def calculate_ballistic_force(mass_kg: float, velocity_m_s: float, barrel_len_m:
         
     kinetic_energy_joules = 0.5 * mass_kg * (velocity_m_s ** 2)
     average_force_newtons = kinetic_energy_joules / barrel_len_m
-    force_tons = average_force_newtons / 9806.65
     
     return {
         "energy_mj": kinetic_energy_joules / 1_000_000,
         "force_kn": average_force_newtons / 1000,
-        "force_tons": force_tons
+        "force_tons": average_force_newtons / 9806.65
     }
 
 class MechanicalBallisticCam:
@@ -40,7 +39,7 @@ class MechanicalBallisticCam:
         el_rad = math.radians(target_elevation_deg)
         time_of_flight_sec = slant_range_meters / (self.muzzle_velocity_m_s * math.cos(el_rad) * 0.92)
         gravity_drop_meters = 0.5 * 9.81 * (time_of_flight_sec ** 2)
-        elevation_correction_deg = math.degrees(math.atan2(gravity_drop_meters, slant_range_meters))
+        elevation_correction_deg = math.degrees(math.atan2(gravity_drop_meters, max(1.0, slant_range_meters)))
         fuze_delay_seconds = time_of_flight_sec + 0.15
         return elevation_correction_deg, fuze_delay_seconds
 
@@ -49,7 +48,6 @@ class Gerat58OilFeedingSystem:
     def __init__(self):
         self.max_capacity_liters = 4.5
         self.current_oil_level_liters = 4.5
-        self.oil_viscosity_nominal = True
         self.injection_nozzles_clear = True
         self.consumption_per_shot = 0.0015 
 
@@ -68,11 +66,9 @@ class Gerat58OilFeedingSystem:
             pulse_telemetry["lubrication_status"] = "RESERVOIR_EMPTY"
             return pulse_telemetry
 
-        actual_consumption = self.consumption_per_shot
-        if barrel_temp_celsius > 150.0:
-            actual_consumption = actual_consumption * 1.5 
-
+        actual_consumption = self.consumption_per_shot * (1.5 if barrel_temp_celsius > 150.0 else 1.0)
         self.current_oil_level_liters = max(0.0, self.current_oil_level_liters - actual_consumption)
+        
         pulse_telemetry["oil_pumped"] = True
         pulse_telemetry["oil_level_remaining_pct"] = (self.current_oil_level_liters / self.max_capacity_liters) * 100.0
         
@@ -103,38 +99,14 @@ class Gerat58StateEngine:
             "1_trigger_pedal": False,
             "2_safety_selector": "SICHER",
             "3_pneumatic_charging_lever": False,
-            "4_breech_lock_handle": "LOCKED",
-            "5_azimuth_handwheel_gear": "LOW",
-            "6_elevation_handwheel_gear": "LOW",
-            "7_main_power_switch": False,
-            "8_servo_engagement_clutch": False,
-            "9_radar_data_link": "LOCAL",
-            "10_fuze_setter_inductor": 0.0,
-            "11_gas_regulator_valve": 3.0,
-            "12_recoil_buffer_valve": "CLOSED",
             "13_travel_lock_clamp": True,
             "14_outrigger_jacks": "RETRACTED",
-            "15_spirit_levels_calibrated": False,
-            "16_sight_illuminator_knob": 0.0,
-            "17_intercom_link": "CONNECTED"
+            "7_main_power_switch": False,
+            "8_servo_engagement_clutch": False,
+            "10_fuze_setter_inductor": 0.0
         }
 
-    def change_system_mode(self, new_mode: str) -> str:
-        allowed_modes = ["TRANSPORT", "COMBAT", "MAINTENANCE"]
-        if new_mode not in allowed_modes:
-            return "Invalid mode. Choose from: TRANSPORT, COMBAT, MAINTENANCE"
-            
-        if new_mode == "COMBAT":
-            return self.setup_combat_mode()
-            
-        if new_mode == "MAINTENANCE":
-            return self.setup_maintenance_mode()
-            
-        self.current_mode = "TRANSPORT"
-        return "System Architecture Switched To: [TRANSPORT MODE]"
-
     def setup_combat_mode(self) -> str:
-        """Guard-clause extraction for combat mode deployment."""
         if self.controls["13_travel_lock_clamp"]:
             return "CANNOT ENTER COMBAT MODE: Travel Lock Clamp is still engaged!"
         if self.controls["14_outrigger_jacks"] != "DEPLOYED":
@@ -146,7 +118,6 @@ class Gerat58StateEngine:
         return "System Architecture Switched To: [COMBAT MODE]"
 
     def setup_maintenance_mode(self) -> str:
-        """Guard-clause extraction for maintenance mode transition."""
         self.system_voltage = 0.0
         self.controls["8_servo_engagement_clutch"] = False
         self.controls["1_trigger_pedal"] = False
@@ -166,10 +137,8 @@ class Gerat58StateEngine:
         return f"Control Modified: {feature_name} set to {value}"
 
     def execute_loading_cycle(self) -> Tuple[bool, str]:
-        """Runs the step-by-step pneumatic loading sequence."""
         if self.hardware_sensors["breech_block"] != "DOWN_OPEN":
             return False, "RAMMING BLOCKED: Breech wedge must be fully down and open."
-            
         if not self.hardware_sensors["compressed_air_charged"]:
             return False, "PNEUMATIC FAILURE: Accumulator flask pressure too low."
             
@@ -178,10 +147,8 @@ class Gerat58StateEngine:
         return True, "Breech loaded, wedge locked home, firing pin cocked."
 
     def process_firing_sequence(self, cam: MechanicalBallisticCam, range_m: float, elevation_deg: float) -> Dict[str, Any]:
-        """Evaluates safety checks, processes cam logic, calculates physics, and checks oil."""
         if self.current_mode != "COMBAT":
             return {"firing_status": "ABORTED", "reason": "Weapon is not in COMBAT mode."}
-            
         if self.controls["2_safety_selector"] == "SICHER":
             return {"firing_status": "ABORTED", "reason": "Safety selector lever is set to SICHER."}
 
@@ -191,7 +158,6 @@ class Gerat58StateEngine:
 
         lead_correction, fuze_time = cam.read_cam_geometry(range_m, elevation_deg)
         self.controls["10_fuze_setter_inductor"] = fuze_time
-        
         force_profile = calculate_ballistic_force(mass_kg=cam.projectile_mass_kg, velocity_m_s=cam.muzzle_velocity_m_s)
         
         self.hardware_sensors["breech_block"] = "DOWN_OPEN"
@@ -207,76 +173,77 @@ class Gerat58StateEngine:
             "firing_status": "SUCCESSFUL 55mm DISCHARGE",
             "calculated_lead_deg": lead_correction,
             "inducted_fuze_time_sec": fuze_time,
-            "recoil_force_kn": force_profile["force_kn"],
-            "oil_pumped": oil_status["oil_pumped"],
-            "oil_level_pct": oil_status["oil_level_remaining_pct"]
+            "recoil_force_kn": force_profile["force_kn"]
         }
 
-def perform_oil_system_maintenance(state_engine: Gerat58StateEngine) -> bool:
-    """Steps the visitor through bleeding the system and refilling the 4.5L oil reservoir."""
-    print("LUFTWAFFE FLAK WERKSTATT - OIL RESERVOIR REFRESH PROTOCOL")
+async def engage_target_and_broadcast(gun: Gerat58StateEngine, cam: MechanicalBallisticCam, bridge: TriSystemBridge, target: Dict[str, Any]):
+    """Fires the physical gun simulator and bridges the live telemetry over the network."""
+    logging.info(f"Engaging Target: {target['target_class']} at {target['range']}m")
     
-    if state_engine.current_mode != "MAINTENANCE":
-        print("MAINTENANCE ABORTED! CRITICAL SAFETY RISK: Cannot open high-pressure lines outside of MAINTENANCE mode.")
-        return False
+    # Process physical firing mechanics
+    report = gun.process_firing_sequence(cam, target["range"], target["elevation"])
+    logging.info(f"Gun Status: {report['firing_status']}")
+    
+    # If the gun successfully fired, bump the threat severity and broadcast to Univac Aegis
+    if "SUCCESSFUL" in report["firing_status"]:
+        target["threat_level"] = 10  # Active weapon discharge priority
+        await bridge.broadcast_target_lock(target)
+    else:
+        logging.warning(f"Engagement Aborted: {report.get('reason')}")
         
-    print("Condition Verified: Weapon safely isolated from servo power.")
-    time.sleep(0.5)
+    return report
 
-    print("[STEP 1/4] Isolating electrical systems...")
-    state_engine.actuate_control("7_main_power_switch", False)
-    print("Feature 7: Main Power Switch flipped to OFF.")
-    time.sleep(0.5)
-
-    print("[STEP 2/4] Purging residual pneumatic and fluid pressures...")
-    state_engine.actuate_control("12_recoil_buffer_valve", "OPEN")
-    state_engine.oiler.current_oil_level_liters = 0.0
-    print("System lines blown out.")
-    time.sleep(0.5)
-
-    print("[STEP 3/4] Clearing injection nozzle ports...")
-    state_engine.oiler.injection_nozzles_clear = True
-    print("Injection nozzles blown clear with dry air back-pressure.")
-    time.sleep(0.5)
-
-    print("[STEP 4/4] Pumping new hydraulic lubricant into reservoir...")
-    state_engine.oiler.current_oil_level_liters = state_engine.oiler.max_capacity_liters
-    state_engine.oiler.oil_viscosity_nominal = True
-    print("Fluid replaced.")
+async def run_museum_interactive_demo():
+    print("\n==================================================================")
+    print(" RHEINMETALL GERAT 58 & UNIVAC AEGIS INTERACTIVE ENGINE DEPLOYED")
+    print("==================================================================\n")
     
-    print("[COMPLETING TASK] Securing structural access hatches...")
-    state_engine.actuate_control("12_recoil_buffer_valve", "CLOSED")
-    print("MAINTENANCE SUCCESSFUL: Lubrication Subsystem Remanufactured!")
-    return True
-
-def run_museum_interactive_demo():
-    print("RHEINMETALL GERAT 58 ANTI-AIRCRAFT SYSTEM INTERACTIVE ENGINE")
-    
+    # 1. Initialize Hardware Components
     gun = Gerat58StateEngine()
     ballistic_cam = MechanicalBallisticCam()
     
-    gun.oiler.current_oil_level_liters = 0.002
+    # 2. Initialize the Network Bridge
+    aegis_endpoint = "http://api.revolutionary.technology:8000/univac-aegis/ingest"
+    aviation_endpoint = "http://api.revolutionary.technology:8001/aviation-telemetry/ingest"
+    bridge = TriSystemBridge(aegis_endpoint, aviation_endpoint, node_id="KDO58-Museum-01")
+    await bridge.initialize()
     
-    print("DEPLOYING WEAPON SYSTEM")
-    print(gun.actuate_control("13_travel_lock_clamp", False))
-    print(gun.actuate_control("14_outrigger_jacks", "DEPLOYED"))
-    print(gun.change_system_mode("COMBAT"))
-    print(gun.actuate_control("3_pneumatic_charging_lever", True))
-    
-    print("EXECUTING COMBAT FIRING LOOP")
-    print("[Trigger Depressed] Firing Round 1...")
-    report1 = gun.process_firing_sequence(ballistic_cam, 5000.0, 30.0)
-    print(f"Status: {report1['firing_status']}")
-    
-    gun.actuate_control("3_pneumatic_charging_lever", True)
-    
-    print("[Trigger Depressed] Firing Round 2...")
-    report2 = gun.process_firing_sequence(ballistic_cam, 4800.0, 32.0)
-    print(f"Status: {report2['firing_status']}")
-    print(f"Reason: {report2.get('reason', 'None')}")
-    
-    print("VISITOR MAINTENANCE INTERVENTION REQUIRED")
-    perform_oil_system_maintenance(gun)
+    try:
+        # 3. Setup Weapon for Combat
+        logging.info("DEPLOYING WEAPON SYSTEM")
+        gun.actuate_control("13_travel_lock_clamp", False)
+        gun.actuate_control("14_outrigger_jacks", "DEPLOYED")
+        gun.change_system_mode("COMBAT")
+        gun.actuate_control("2_safety_selector", "EINZEL")
+        
+        # 4. Simulate a live radar track coming from the HPC swarm
+        simulated_target = {
+            "azimuth": 145.2,
+            "elevation": 30.5,
+            "range": 5000.0,
+            "velocity_knots": 480.0,
+            "altitude_feet": 24000.0,
+            "heading": 330.0,
+            "v_speed": -500.0,
+            "target_class": "HEAVY_BOMBER",
+            "threat_level": 8
+        }
+        
+        # 5. Fire round 1 (Requires manual pneumatic charge first)
+        gun.actuate_control("3_pneumatic_charging_lever", True)
+        await engage_target_and_broadcast(gun, ballistic_cam, bridge, simulated_target)
+        await asyncio.sleep(1.0)
+        
+        # 6. Update target kinematics and fire round 2
+        simulated_target["range"] = 4800.0
+        simulated_target["elevation"] = 32.0
+        gun.actuate_control("3_pneumatic_charging_lever", True)
+        await engage_target_and_broadcast(gun, ballistic_cam, bridge, simulated_target)
+
+    finally:
+        # 7. Ensure network sockets are safely closed on shutdown
+        await bridge.shutdown()
 
 if __name__ == "__main__":
-    run_museum_interactive_demo()
+    # The asyncio event loop correctly manages both the gun physics and the network bridging
+    asyncio.run(run_museum_interactive_demo())

@@ -7,6 +7,8 @@ This complete, production-ready module maps the 17 operational controls, incorpo
 import time
 import math
 from typing import Dict, Any, Tuple
+import asyncio
+from kdo58_univac_aviation_bridge import TriSystemBridge
 
 class MechanicalBallisticCam:
     """
@@ -82,6 +84,44 @@ class Gerat58StateEngine:
             "17_intercom_link": "CONNECTED"         # Throat-mic link to Fire Control Center
         }
 
+async def radar_processing_loop():
+    # 1. Initialize the Bridge endpoints
+    aegis_endpoint = "http://api.revolutionary.technology:8000/univac-aegis/ingest"
+    aviation_endpoint = "http://api.revolutionary.technology:8001/aviation-telemetry/ingest"
+    
+    bridge = TriSystemBridge(aegis_endpoint, aviation_endpoint, node_id="KDO58-Main-Swarm")
+    await bridge.initialize()
+
+    try:
+        while True:
+            # 2. Simulate grabbing a computed track from your kdo58_hpc_swarm
+            # In production, replace this with your actual radar output queue
+            current_target = {
+                "azimuth": 145.2,
+                "elevation": 12.5,
+                "range": 15400.0,
+                "velocity_knots": 480.0,
+                "altitude_feet": 24000.0,
+                "heading": 330.0,
+                "v_speed": -500.0,
+                "target_class": "HEAVY_BOMBER",
+                "threat_level": 8
+            }
+
+            # 3. Fire the broadcast asynchronously
+            # This executes instantly and returns control to your while loop
+            await bridge.broadcast_target_lock(current_target)
+
+            # Polling delay representing your HPC swarm tick rate (e.g., 10Hz)
+            await asyncio.sleep(0.1)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await bridge.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(radar_processing_loop())
     def change_system_mode(self, new_mode: str) -> str:
         """Toggles between the major structural maintenance and deployment profiles."""
         allowed_modes = ["TRANSPORT", "COMBAT", "MAINTENANCE"]
